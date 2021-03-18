@@ -1,0 +1,64 @@
+package timescale
+
+import (
+	"context"
+	"fmt"
+	"github.com/jackc/pgx/v4/pgxpool"
+	"time"
+
+	helpers "powerpilot.visualstudio.com/PowerPilot/_git/pphelpers.git"
+)
+
+// TimescaleEngine implements DBEngine
+type TimescaleEngine struct {
+	pool             *pgxpool.Pool
+	failureChan      chan<- error
+	authLoggerHelper helpers.AuthLoggerHelper
+}
+
+func NewTimescaleEngine(psqlURL string, authLoggerHelper helpers.AuthLoggerHelper, failureChan chan<- error) (*TimescaleEngine, error) {
+	var err error
+	var pool *pgxpool.Pool
+	retries := 0
+	for {
+		pool, err = pgxpool.Connect(context.Background(), psqlURL)
+		if err != nil {
+			retries++
+			if retries > 5 {
+				return nil, err
+			}
+			fmt.Println(err)
+			time.Sleep(time.Second * 2)
+			continue
+		}
+
+		break
+	}
+
+	return &TimescaleEngine{
+		pool:             pool,
+		authLoggerHelper: authLoggerHelper,
+		failureChan:      failureChan,
+	}, nil
+}
+
+// Exec acquires a connection and runs a query
+func (db *TimescaleEngine) Exec(ctx context.Context, sql string, arguments ...interface{}) error {
+	conn, err := db.pool.Acquire(context.Background())
+	if err != nil {
+		// catastrophic error
+		db.failureChan <- err
+		return err
+	}
+
+	defer conn.Release()
+
+	_, err = conn.Exec(context.Background(), sql, arguments...)
+
+	return err
+}
+
+// Close the pool
+func (db *TimescaleEngine) Close() {
+	db.pool.Close()
+}

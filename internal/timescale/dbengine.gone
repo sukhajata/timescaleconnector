@@ -1,0 +1,11 @@
+package timescale
+
+import (
+	"context"
+)
+
+// DBEngine represents database connection pool
+type DBEngine interface {
+	Exec(ctx context.Context, sql string, arguments ...interface{}) error
+	Close()
+}

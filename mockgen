@@ -1,0 +1,11 @@
+GO111MODULE=on go get github.com/golang/mock/mockgen@v1.4.4
+
+mockgen -destination=mocks/mockdbengine.go -package=mocks github.com/sukhajata/devicetwin/pkg/db SQLEngine
+
+mockgen -destination=mocks/mockdbclient.go -package=mocks github.com/sukhajata/timescaleconnector/timescale DBClient
+
+mockgen -destination=mocks/mockauthclient.go -package=mocks github.com/sukhajata/ppauth AuthServiceClient
+
+mockgen -destination=mocks/mockloggerclient.go -package=mocks github.com/sukhajata/pplogger LoggerServiceClient
+
+mockgen -destination=mocks/mockmqttclient.go -package=mocks powerpilot.visualstudio.com/PowerPilot/_git/ppmqtt.git Client

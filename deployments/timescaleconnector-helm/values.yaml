@@ -1,0 +1,9 @@
+replicaCount: 2
+
+image:
+  repository: powerpilotregistry.azurecr.io/timescaleconnector
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  httpPort: 80
