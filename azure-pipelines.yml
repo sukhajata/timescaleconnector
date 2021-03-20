@@ -1,0 +1,318 @@
+# Docker
+# Build and push an image to Azure Container Registry
+# https://docs.microsoft.com/azure/devops/pipelines/languages/docker
+
+trigger:
+- main
+
+resources:
+- repo: self
+
+variables:
+  # Container registry service connection established during pipeline creation
+  dockerRegistryServiceConnection: 'test'
+  imageRepository: 'timescaleconnector'
+  containerRegistry: 'registry.azurecr.io'
+  dockerfilePath: '$(Build.SourcesDirectory)/Dockerfile'
+  devTag: 'dev-$(Build.BuildId)'
+  stgTag: 'stg-$(Build.BuildId)'
+  prodTag: 'prod-$(Build.BuildId)'
+  deploymentName: 'timescale-connector'
+  pat: 'test'  
+  
+  # Agent VM image name
+  vmImageName: 'ubuntu-20.04'
+
+stages:
+- stage: UnitTest
+  displayName: Unit test
+  jobs:
+  - job: UnitTest 
+    displayName: Unit test 
+    pool:
+      vmImage: $(vmImageName)
+    steps:
+    - bash: git config --global url."https://anything:${PAT}@powerpilot.visualstudio.com".insteadOf "https://powerpilot.visualstudio.com"
+      displayName: add git credentials
+      env:
+        PAT: $(pat)
+
+    - task: Go@0
+      inputs:
+        command: 'test' # Options: get, build, test, custom
+        arguments: './...'
+      
+- stage: Build
+  displayName: Build and push dev
+  jobs:
+  - job: Build
+    displayName: Build
+    pool:
+      vmImage: $(vmImageName)
+    steps:
+    - task: Docker@2
+      displayName: Build
+      inputs:
+        command: build
+        containerRegistry: $(dockerRegistryServiceConnection)
+        repository: $(imageRepository)
+        dockerfile: $(dockerfilePath)
+        tags: $(devTag)
+        arguments: --build-arg pat=$(pat)
+
+    - task: Docker@2
+      displayName: Push
+      inputs:
+        command: push
+        containerRegistry: $(dockerRegistryServiceConnection)
+        repository: $(imageRepository)
+        tags: $(devTag)  
+
+- stage: TestDev
+  displayName: Test dev
+  jobs:
+  - job: RunsOnServer
+    pool: Server
+    steps:
+    - task: Delay@1
+      inputs:
+        delayForMinutes: '10'
+
+  - deployment: CheckTestDev
+    dependsOn: RunsOnServer
+    displayName: check and test dev deployment
+    pool:
+      vmImage: $(vmImageName)
+      #name: $(poolName)
+    # creates an environment if it doesn't exist. Environment should already exist
+    environment: 'dev.tenant-devpower'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: git://PowerPilot/pytest-fast-path
+
+          - task: Kubernetes@1
+            displayName: Get image name
+            name: taskGetImage
+            continueOnError: true
+            inputs:
+              connectionType: Kubernetes Service Connection
+              #kubernetesServiceEndpoint: '${{ parameters.k8sServiceConnection }}'
+              namespace: tenant-devpower
+              command: get
+              arguments: "deployment $(deploymentName)"
+              outputFormat: "jsonpath='{$.spec.template.spec.containers[:1].image}'" # the warning is OK
+
+          # taskGetImage.KubectlOutput now holds a value like this (including quotes): 'my-registry/my-image:123'
+
+            #check that the image on k8s matches this build
+          - bash: |
+              if [[ $CURRENT == *"${EXPECTED}"* ]]; then
+                echo "New image deployed"
+              else
+                echo "New image not deployed"
+                exit 1
+              fi
+            displayName: Check deployment
+            failOnStderr: true
+            env:
+              CURRENT: $(taskGetImage.KubectlOutput)
+              EXPECTED: $(devTag)
+
+          - task: UsePythonVersion@0
+            displayName: 'Use Python 3.x'
+
+          - bash: |
+              pip3 install -r requirements.txt
+              pytest --tenant=devpower --junitxml=TEST-result.xml
+            displayName: Check deployment and test
+
+          - task: PublishTestResults@2
+            displayName: 'Publish Test Results **/TEST-*.xml'
+
+#pull the container and re tag it for staging  
+- stage: PushStaging
+  displayName: Push to staging
+  jobs: 
+  - deployment: PushStaging
+    displayName: push to stagepower
+    pool:
+      #name: $(poolName)
+      vmImage: $(vmImageName)
+    # creates an environment if it doesn't exist. Environment should already exist with approval check created.
+    environment: 'ppcores1.tenant-stagepower'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: Docker@2
+            displayName: login to ACR
+            inputs:
+              command: login
+              containerRegistry: $(dockerRegistryServiceConnection)
+
+          - bash: |
+              echo "docker pull ${CONTAINER_REGISTRY}/${IMAGE_REPOSITORY}:${DEV_TAG}"
+              docker pull ${CONTAINER_REGISTRY}/${IMAGE_REPOSITORY}:${DEV_TAG}
+              echo "docker tag ${CONTAINER_REGISTRY}/${IMAGE_REPOSITORY}:${DEV_TAG}  ${CONTAINER_REGISTRY}/${IMAGE_REPOSITORY}:${STG_TAG}"
+              docker tag ${CONTAINER_REGISTRY}/${IMAGE_REPOSITORY}:${DEV_TAG}  ${CONTAINER_REGISTRY}/${IMAGE_REPOSITORY}:${STG_TAG}
+              echo "docker push ${CONTAINER_REGISTRY}/${IMAGE_REPOSITORY}:${STG_TAG}"
+              docker push ${CONTAINER_REGISTRY}/${IMAGE_REPOSITORY}:${STG_TAG}
+
+              echo "Deployed ${STG_TAG}"
+            env:
+              CONTAINER_REGISTRY: $(containerRegistry)
+              IMAGE_REPOSITORY: $(imageRepository)
+              DEV_TAG: $(devTag)
+              STG_TAG: $(stgTag)
+
+
+- stage: TestStaging
+  displayName: Test staging
+  jobs:
+
+  - job: RunsOnServer
+    pool: Server
+    steps:
+      - task: Delay@1
+        inputs:
+          delayForMinutes: '10'
+
+  - deployment: CheckTestStaging
+    dependsOn: RunsOnServer
+    displayName: check and test staging deployment
+    pool:
+      vmImage: $(vmImageName)
+      #name: $(poolName)
+    # creates an environment if it doesn't exist. Environment should already exist
+    environment: 'ppcores1.tenant-stagepower'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+            - checkout: git://PowerPilot/pytest-fast-path
+
+            - task: Kubernetes@1
+              displayName: Get image name
+              name: taskGetImage
+              continueOnError: true
+              inputs:
+                connectionType: Kubernetes Service Connection
+                #kubernetesServiceEndpoint: '${{ parameters.k8sServiceConnection }}'
+                namespace: tenant-stagepower
+                command: get
+                arguments: "deployment $(deploymentName)"
+                outputFormat: "jsonpath='{$.spec.template.spec.containers[:1].image}'" # the warning is OK
+
+            # taskGetImage.KubectlOutput now holds a value like this (including quotes): 'my-registry/my-image:123'
+
+            #check that the image on k8s matches this build
+            - bash: |
+                if [[ $CURRENT == *"${EXPECTED}"* ]]; then
+                  echo "New image deployed"
+                else
+                  echo "New image not deployed"
+                  exit 1
+                fi
+              displayName: Check deployment and test
+              failOnStderr: true
+              env:
+                CURRENT: $(taskGetImage.KubectlOutput)
+                EXPECTED: $(stgTag)
+
+            - task: UsePythonVersion@0
+              displayName: 'Use Python 3.x'
+            
+              #tests
+            - bash: |
+                pip3 install -r requirements.txt
+                pytest --tenant=stagepower --junitxml=TEST-result.xml
+              displayName: Check deployment and test
+
+            - task: PublishTestResults@2
+              displayName: 'Publish Test Results **/TEST-*.xml'
+
+#pull the container and re tag it for prod  
+- stage: PushProd
+  displayName: Push to production
+  jobs: 
+  - deployment: PushProd
+    displayName: push to prod
+    pool:
+      #name: $(poolName)
+      vmImage: $(vmImageName)
+    # creates an environment if it doesn't exist. Environment should already exist with approval check created.
+    environment: 'ppcores1.tenant-stagepower'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: Docker@2
+            displayName: login to ACR
+            inputs:
+              command: login
+              containerRegistry: $(dockerRegistryServiceConnection)
+
+          - bash: |
+              echo "docker pull ${CONTAINER_REGISTRY}/${IMAGE_REPOSITORY}:${STG_TAG}"
+              docker pull ${CONTAINER_REGISTRY}/${IMAGE_REPOSITORY}:${STG_TAG}
+              echo "docker tag ${CONTAINER_REGISTRY}/${IMAGE_REPOSITORY}:${STG_TAG}  ${CONTAINER_REGISTRY}/${IMAGE_REPOSITORY}:${PROD_TAG}"
+              docker tag ${CONTAINER_REGISTRY}/${IMAGE_REPOSITORY}:${STG_TAG}  ${CONTAINER_REGISTRY}/${IMAGE_REPOSITORY}:${PROD_TAG}
+              echo "docker push ${CONTAINER_REGISTRY}/${IMAGE_REPOSITORY}:${PROD_TAG}"
+              docker push ${CONTAINER_REGISTRY}/${IMAGE_REPOSITORY}:${PROD_TAG}
+
+              echo "Deployed ${PROD_TAG}"
+            env:
+              CONTAINER_REGISTRY: $(containerRegistry)
+              IMAGE_REPOSITORY: $(imageRepository)
+              STG_TAG: $(stgTag)
+              PROD_TAG: $(prodTag)
+
+- stage: CheckProd
+  displayName: Check prod deployment
+  jobs:
+
+  - job: RunsOnServer
+    pool: Server
+    steps:
+      - task: Delay@1
+        inputs:
+          delayForMinutes: '10'
+
+  - deployment: CheckProd
+    dependsOn: RunsOnServer
+    displayName: check prod deployment
+    pool:
+      vmImage: $(vmImageName)
+      #name: $(poolName)
+    # creates an environment if it doesn't exist. Environment should already exist
+    environment: 'ppcores1.tenant-westpower1'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+            - task: Kubernetes@1
+              displayName: Get image name
+              name: taskGetImage
+              continueOnError: true
+              inputs:
+                connectionType: Kubernetes Service Connection
+                #kubernetesServiceEndpoint: '${{ parameters.k8sServiceConnection }}'
+                namespace: tenant-westpower1
+                command: get
+                arguments: "deployment $(deploymentName)"
+                outputFormat: "jsonpath='{$.spec.template.spec.containers[:1].image}'" # the warning is OK
+
+            - bash: |
+                if [[ $CURRENT == *"${EXPECTED}"* ]]; then
+                  echo "New image deployed"
+                else
+                  echo "New image not deployed"
+                  exit 1
+                fi
+              displayName: Check deployment and test
+              failOnStderr: true
+              env:
+                CURRENT: $(taskGetImage.KubectlOutput)
+                EXPECTED: $(prodTag)                
